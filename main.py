@@ -1,8 +1,10 @@
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QAbstractAnimation,
     QParallelAnimationGroup,
     QRectF,
+    QTimer,
     Qt,
     QVariantAnimation,
 )
@@ -12,7 +14,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QLabel,
     QMainWindow,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -50,7 +51,7 @@ class _GradientWindow(QMainWindow):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setWindowOpacity(1) #预留透明
+        self.setWindowOpacity(1)
         self._radius = radius
         self._border_width = 8
 
@@ -76,20 +77,17 @@ class _GradientWindow(QMainWindow):
         self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
 
-class SvgWindow(_GradientWindow):
-    def __init__(self, size: int = 80, radius: int = 10):
+class _SvgWindow(_GradientWindow):
+    def __init__(self, svg_path: str, size: int = 80, radius: int = 10):
         super().__init__(radius)
-        screen_w, _ = get_screen_size()
-        x = (screen_w - size) // 2
-        self.setGeometry(x, 0, size, size)
+        self.setGeometry(0, 0, size, size)
 
         central = QWidget()
         central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setCentralWidget(central)
 
-        svg_path = Path(__file__).parent / "ball.svg"
         icon_size = size - 25
-        self.svg_label = load_white_svg(str(svg_path), icon_size)
+        self.svg_label = load_white_svg(svg_path, icon_size)
         self.svg_label.setStyleSheet("background: transparent; opacity: 0.70;")
 
         layout = QVBoxLayout(central)
@@ -97,12 +95,10 @@ class SvgWindow(_GradientWindow):
         layout.addWidget(self.svg_label, 0, Qt.AlignmentFlag.AlignCenter)
 
 
-class TextWindow(_GradientWindow):
-    def __init__(self, width: int = 400, height: int = 40, radius: int = 10):
+class _TextWindow(_GradientWindow):
+    def __init__(self, title: str, subtitle: str, width: int = 460, height: int = 80, radius: int = 10):
         super().__init__(radius)
-        screen_w, _ = get_screen_size()
-        x = (screen_w - width) // 2
-        self.setGeometry(x, 0, width, height)
+        self.setGeometry(0, 0, width, height)
 
         central = QWidget()
         central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -112,84 +108,105 @@ class TextWindow(_GradientWindow):
         layout.setContentsMargins(16, 4, 16, 4)
         layout.setSpacing(1)
 
-        self.title = QLabel("主标题")
-        self.title.setStyleSheet("color: white; font-size: 34px; font-weight: bold;")
-        layout.addWidget(self.title)
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet("color: white; font-size: 34px; font-weight: bold;")
+        layout.addWidget(self.title_label)
 
-        self.subtitle = QLabel("副标题")
-        self.subtitle.setStyleSheet("color: rgba(255,255,255,0.85); font-size: 12px;")
-        layout.addWidget(self.subtitle)
+        self.subtitle_label = QLabel(subtitle)
+        self.subtitle_label.setStyleSheet("color: rgba(255,255,255,0.85); font-size: 12px;")
+        layout.addWidget(self.subtitle_label)
 
 
-class ButtonWindow(_GradientWindow):
-    def __init__(self, width: int = 60, height: int = 30, radius: int = 10):
-        super().__init__(radius)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
+class TopBarManager:
+    """顶部通知栏管理器。
+
+    管理两个窗口：左侧方形 SVG 窗口 + 右侧矩形标题窗口，
+    支持从屏幕上方滑入/滑出动画和自动隐藏。
+
+    用法:
+        manager = TopBarManager(
+            svg_path="icon.svg",
+            title="语文课",
+            subtitle="王老师 · 3班",
+            stay_ms=5000,
         )
-        self.setGeometry(0, 0, width, height)
+        manager.show()
+    """
 
-        central = QWidget()
-        central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setCentralWidget(central)
-
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self.btn = QPushButton("动画")
-        self.btn.setFixedSize(width, height)
-        self.btn.setStyleSheet(
-            "QPushButton { color: white; background: transparent; border: none; font-size: 12px; }"
-            "QPushButton:hover { background: rgba(255,255,255,0.15); border-radius: 6px; }"
-        )
-        self.btn.clicked.connect(self._toggle)
-        layout.addWidget(self.btn)
-
-        self._drag_pos = None
+    def __init__(
+        self,
+        svg_path: str,
+        title: str = "",
+        subtitle: str = "",
+        stay_ms: int = 0,
+        svg_size: int = 80,
+        text_width: int = 460,
+        gap: int = 4,
+    ):
+        """
+        Args:
+            svg_path: SVG 图标文件路径
+            title: 主标题文字
+            subtitle: 副标题文字
+            stay_ms: 显示停留时间（毫秒），0 表示不自动隐藏
+            svg_size: SVG 窗口边长
+            text_width: 文字窗口宽度
+            gap: 两窗口间距
+        """
+        self._stay_ms = stay_ms
+        self._stay_timer = QTimer()
+        self._stay_timer.setSingleShot(True)
+        self._stay_timer.timeout.connect(self.hide)
         self._visible = True
-        self._targets: list[QMainWindow] = []
+        self._anim_group: QParallelAnimationGroup | None = None
 
-    def set_targets(self, *windows: QMainWindow):
-        self._targets = list(windows)
+        screen_w, _ = get_screen_size()
+        total_w = svg_size + gap + text_width
+        start_x = (screen_w - total_w) // 2
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint()
-        super().mousePressEvent(event)
+        self.svg_win = _SvgWindow(svg_path, size=svg_size)
+        self.svg_win.setGeometry(start_x, 0, svg_size, svg_size)
 
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None:
-            delta = event.globalPosition().toPoint() - self._drag_pos
-            self.move(self.x() + delta.x(), self.y() + delta.y())
-            self._drag_pos = event.globalPosition().toPoint()
-        super().mouseMoveEvent(event)
+        self.text_win = _TextWindow(title, subtitle, width=text_width, height=svg_size)
+        self.text_win.setGeometry(start_x + svg_size + gap, 0, text_width, svg_size)
 
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
+        self._windows = [self.svg_win, self.text_win]
 
-    def _toggle(self):
-        self._visible = not self._visible
+    def show(self):
+        """滑入显示，若 stay_ms > 0 则开始倒计时自动隐藏。"""
+        self._visible = True
+        for win in self._windows:
+            win.move(win.x(), -win.height())
+            win.show()
+        self._animate()
+        if self._stay_ms > 0:
+            self._stay_timer.start(self._stay_ms)
 
-        def ease_in_out_back(t: float) -> float:
-            c1 = 1.70158
-            c2 = c1 * 1.525
-            if t < 0.5:
-                return (pow(2 * t, 2) * ((c2 + 1) * 2 * t - c2)) / 2
-            else:
-                return (pow(2 * t - 2, 2) * ((c2 + 1) * (t * 2 - 2) + c2) + 2) / 2
+    def hide(self):
+        """滑出隐藏。"""
+        self._visible = False
+        self._stay_timer.stop()
+        self._animate(on_finish=lambda: [win.hide() for win in self._windows])
+
+    def toggle(self):
+        """切换显示/隐藏状态。"""
+        if self._visible:
+            self.hide()
+        else:
+            self.show()
+
+    def _animate(self, on_finish=None):
+        if self._anim_group is not None and self._anim_group.state() == QAbstractAnimation.State.Running:
+            self._anim_group.stop()
 
         group = QParallelAnimationGroup()
-        for win in self._targets:
+        for win in self._windows:
             x = win.x()
             h = win.height()
             if self._visible:
                 start_y, end_y = -h, 0
-                win.move(x, start_y)
             else:
-                start_y, end_y = 0, -h
+                start_y, end_y = win.y(), -h
 
             anim = QVariantAnimation()
             anim.setDuration(600)
@@ -197,35 +214,35 @@ class ButtonWindow(_GradientWindow):
             anim.setEndValue(1.0)
             anim.valueChanged.connect(
                 lambda v, w=win, sx=x, sy=start_y, ey=end_y: w.move(
-                    sx, int(sy + (ey - sy) * ease_in_out_back(v))
+                    sx, int(sy + (ey - sy) * _ease_in_out_back(v))
                 )
             )
             group.addAnimation(anim)
+        if on_finish is not None:
+            group.finished.connect(on_finish)
         group.start()
         self._anim_group = group
+
+
+def _ease_in_out_back(t: float) -> float:
+    c1 = 1.70158
+    c2 = c1 * 1.525
+    if t < 0.5:
+        return (pow(2 * t, 2) * ((c2 + 1) * 2 * t - c2)) / 2
+    else:
+        return (pow(2 * t - 2, 2) * ((c2 + 1) * (t * 2 - 2) + c2) + 2) / 2
 
 
 if __name__ == "__main__":
     app = QApplication([])
 
-    svg_size = 80
-    text_width = 460
-    text_height = svg_size
-    gap = 4
-    total_w = svg_size + gap + text_width
-    screen_w, _ = get_screen_size()
-    start_x = (screen_w - total_w) // 2
-
-    svg_win = SvgWindow(size=svg_size)
-    svg_win.setGeometry(start_x, 0, svg_size, svg_size)
-    svg_win.show()
-
-    text_win = TextWindow(width=text_width, height=text_height)
-    text_win.setGeometry(start_x + svg_size + gap, 0, text_width, text_height)
-    text_win.show()
-
-    btn_win = ButtonWindow()
-    btn_win.set_targets(svg_win, text_win)
-    btn_win.show()
-
+    # ── 示例 1：基本用法 ──────────────────────────────
+    svg_path = str(Path(__file__).parent / "ball.svg")
+    notify = TopBarManager(
+        svg_path=svg_path,
+        title="距离上课还有2分钟",
+        subtitle="马上要上课了，请做好准备",
+        stay_ms=5000,  # 5 秒后自动滑出
+    )
+    notify.show()
     app.exec()
